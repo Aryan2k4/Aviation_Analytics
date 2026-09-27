@@ -1,0 +1,455 @@
+version: '3.8'
+
+# =============================================================================
+# SHARED CONFIGURATION
+# =============================================================================
+x-airflow-common: &airflow-common
+  build: .
+  image: sairam030/custom-airflow-spark:2.9.0
+  environment: &airflow-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__FERNET_KEY: 'UKMzEm3yIuFYEq1y3-2FxPNWSVwRASpahmQ9kQfEr8E='
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth'
+    AIRFLOW__WEBSERVER__SESSION_BACKEND: "securecookie"
+    AIRFLOW__WEBSERVER__RBAC: "True"
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "True"
+    SPARK_HOME: /opt/spark
+    JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
+    SPARK_MASTER_URL: "local[*]"
+    AWS_ACCESS_KEY_ID: minioadmin
+    AWS_SECRET_ACCESS_KEY: minioadmin
+    AIRFLOW_CONN_MINIO_S3: s3://minioadmin:minioadmin@?host=http://minio:9000&endpoint_url=http://minio:9000
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./src:/opt/airflow/src
+    - ./scripts:/opt/airflow/scripts
+    - /media/D/data/aviation_data:/data/aviation_data:ro
+    - aviation-output:/tmp/aviation
+  user: "${AIRFLOW_UID:-1000}:0"
+  depends_on:
+    postgres:
+      condition: service_healthy
+    minio:
+      condition: service_healthy
+  networks:
+    - airflow-net
+
+services:
+  # =============================================================================
+  # STORAGE LAYER
+  # =============================================================================
+  postgres:
+    image: postgres:15-alpine
+    container_name: postgres
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+    networks:
+      - airflow-net
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - airflow-net
+    restart: unless-stopped
+
+  # =============================================================================
+  # SPARK CLUSTER
+  # =============================================================================
+  spark-master:
+    build: .
+    image: sairam030/custom-airflow-spark:2.9.0
+    container_name: spark-master
+    hostname: spark-master
+    user: root
+    command: bash /opt/airflow/scripts/spark_master_entrypoint.sh
+    environment:
+      SPARK_MASTER_HOST: spark-master
+      SPARK_MASTER_PORT: 7077
+      SPARK_MASTER_WEBUI_PORT: 8080
+      SPARK_NO_DAEMONIZE: "true"
+      PYTHONPATH: /opt/airflow
+      PYTHONUNBUFFERED: "1"
+    ports:
+      - "7077:7077"
+      - "8081:8080"
+    volumes:
+      - ./src:/opt/airflow/src
+      - ./logs:/opt/airflow/logs
+      - ./scripts:/opt/airflow/scripts
+      - ./data:/opt/airflow/data
+      - ./flight_routing_table.csv:/opt/airflow/flight_routing_table.csv
+      - spark-logs:/opt/spark/logs
+    networks:
+      - airflow-net
+    depends_on:
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+
+  spark-worker-1:
+    build: .
+    image: sairam030/custom-airflow-spark:2.9.0
+    container_name: spark-worker-1
+    hostname: spark-worker-1
+    user: root
+    command: >
+      bash -c "
+      /opt/spark/sbin/start-worker.sh spark://spark-master:7077 &&
+      tail -f /opt/spark/logs/*
+      "
+    environment:
+      SPARK_MASTER_URL: spark://spark-master:7077
+      SPARK_WORKER_CORES: 2
+      SPARK_WORKER_MEMORY: 2g
+      SPARK_WORKER_WEBUI_PORT: 8081
+      SPARK_NO_DAEMONIZE: "true"
+      PYTHONPATH: /opt/airflow
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    ports:
+      - "8082:8081"
+    volumes:
+      - ./src:/opt/airflow/src
+      - ./data:/opt/airflow/data
+      - spark-logs:/opt/spark/logs
+    networks:
+      - airflow-net
+    restart: unless-stopped
+
+  spark-worker-2:
+    build: .
+    image: sairam030/custom-airflow-spark:2.9.0
+    container_name: spark-worker-2
+    hostname: spark-worker-2
+    user: root
+    command: >
+      bash -c "
+      /opt/spark/sbin/start-worker.sh spark://spark-master:7077 &&
+      tail -f /opt/spark/logs/*
+      "
+    environment:
+      SPARK_MASTER_URL: spark://spark-master:7077
+      SPARK_WORKER_CORES: 2
+      SPARK_WORKER_MEMORY: 2g
+      SPARK_WORKER_WEBUI_PORT: 8081
+      SPARK_NO_DAEMONIZE: "true"
+      PYTHONPATH: /opt/airflow
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    ports:
+      - "8083:8081"
+    volumes:
+      - ./src:/opt/airflow/src
+      - ./data:/opt/airflow/data
+      - spark-logs:/opt/spark/logs
+    networks:
+      - airflow-net
+    restart: unless-stopped
+
+  # =============================================================================
+  # AIRFLOW ORCHESTRATION
+  # =============================================================================
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        mkdir -p /sources/logs /sources/dags /sources/plugins
+        chown -R "${AIRFLOW_UID:-1000}:0" /sources/{logs,dags,plugins}
+        
+        mkdir -p /tmp/aviation/{bronze,silver,gold}/states
+        mkdir -p /tmp/aviation/mapping/flight_routes
+        chown -R "${AIRFLOW_UID:-1000}:0" /tmp/aviation
+        chmod -R 775 /tmp/aviation
+        
+        airflow db migrate
+        
+        airflow users create \
+          --username admin \
+          --firstname Admin \
+          --lastname User \
+          --role Admin \
+          --email admin@example.com \
+          --password admin || true
+        
+        echo "✅ Airflow initialization complete!"
+    environment:
+      <<: *airflow-env
+    user: "0:0"
+    volumes:
+      - .:/sources
+
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: airflow-webserver
+    command: webserver
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    command: scheduler
+    healthcheck:
+      test: ["CMD-SHELL", "airflow jobs check --job-type SchedulerJob || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # =============================================================================
+  # KAFKA STREAMING PLATFORM
+  # =============================================================================
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    volumes:
+      - zookeeper-data:/var/lib/zookeeper/data
+      - zookeeper-logs:/var/lib/zookeeper/log
+    networks:
+      - airflow-net
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    networks:
+      - airflow-net
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8084:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: aviation-cluster
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
+    networks:
+      - airflow-net
+    restart: unless-stopped
+
+  # =============================================================================
+  # SPEED LAYER (Real-time Processing)
+  # =============================================================================
+  
+  kafka-producer:
+    build: .
+    image: sairam030/custom-airflow-spark:2.9.0
+    container_name: kafka-producer
+    command: >
+      bash -c "
+      cd /opt/airflow &&
+      python -c 'from src.speed.kafka_producer import run_producer; run_producer()'
+      "
+    volumes:
+      - ./src:/opt/airflow/src
+      - ./data:/opt/airflow/data
+    environment:
+      PYTHONPATH: /opt/airflow
+      PYTHONUNBUFFERED: "1"
+      USE_MOCK_DATA: "false"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - airflow-net
+    restart: unless-stopped
+
+  flight-tracker:
+    build: .
+    image: sairam030/custom-airflow-spark:2.9.0
+    container_name: flight-tracker
+    command: >
+      bash -c "
+      cd /opt/airflow &&
+      python -m uvicorn src.webapp.server:app --host 0.0.0.0 --port 8050
+      "
+    ports:
+      - "8050:8050"
+    volumes:
+      - ./src:/opt/airflow/src
+      - ./data:/opt/airflow/data
+    environment:
+      PYTHONPATH: /opt/airflow
+      PYTHONUNBUFFERED: "1"
+      PERSISTENCE_API_KEY: "aviation-secret-key"
+    depends_on:
+      kafka:
+        condition: service_healthy
+      spark-master:
+        condition: service_started
+    networks:
+      - airflow-net
+    restart: unless-stopped
+
+  # =============================================================================
+  # ANALYTICS & VISUALIZATION
+  # =============================================================================
+  metabase:
+    image: metabase/metabase:latest
+    container_name: metabase
+    ports:
+      - "3000:3000"
+    environment:
+      MB_DB_TYPE: postgres
+      MB_DB_DBNAME: airflow
+      MB_DB_PORT: 5432
+      MB_DB_USER: airflow
+      MB_DB_PASS: airflow
+      MB_DB_HOST: postgres
+    depends_on:
+      - postgres
+    networks:
+      - airflow-net
+    restart: unless-stopped
+
+  # =============================================================================
+  # AI OPERATIONS (Log Analysis & Chatbot)
+  # =============================================================================
+  ai-ops:
+    image: python:3.9-slim
+    container_name: ai-ops
+    working_dir: /opt/airflow
+    command: >
+      bash -c "
+      
+      pip install streamlit google-generativeai &&
+      streamlit run src/monitoring/ai_dashboard.py --server.port 8501 --server.address 0.0.0.0
+      "
+    environment:
+      # GET YOUR KEY HERE: https://aistudio.google.com/app/apikey
+      GEMINI_API_KEY: "[GCP_API_KEY]"
+    volumes:
+      - ./logs:/opt/airflow/logs:ro  # Read-only access to logs
+      - ./src:/opt/airflow/src:ro    # Read-only access to code
+    ports:
+      - "8501:8501"                  # Access dashboard at http://localhost:8501
+    networks:
+      - airflow-net
+    restart: unless-stopped
+
+# =============================================================================
+# VOLUMES & NETWORKS
+# =============================================================================
+volumes:
+  postgres-data:
+  minio-data:
+  spark-logs:
+  zookeeper-data:
+  zookeeper-logs:
+  kafka-data:
+  aviation-output:
+
+networks:
+  airflow-net:
+    driver: bridge
+
+# =============================================================================
+# ARCHITECTURE FLOW
+# =============================================================================
+# SPEED LAYER (Real-time):
+#   1. kafka-producer → Fetches OpenSky API → aviation-india-states (raw)
+#   2. spark-master → Enriches with routes → aviation-enriched-states
+#   3. flight-tracker → Accumulates state → WebSocket + REST API
+#   4. DAG → Persists to Silver layer hourly
+#
+# BATCH LAYER (Hourly):
+#   1. raw_to_bronze_dag → Raw files → Bronze (Parquet)
+#   2. bronze_to_silver_dag → Bronze → Silver (Enriched Parquet)
+#   3. silver_to_gold_dag → Silver → Gold (Aggregated analytics)
+# =============================================================================
+
+
+
